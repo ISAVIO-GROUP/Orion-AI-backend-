@@ -70,16 +70,15 @@ const RESEND_API_KEY      = process.env.RESEND_API_KEY;
 const FEEDBACK_NOTIFY_EMAIL = process.env.FEEDBACK_NOTIFY_EMAIL || ORION_ADMINS[0];
 const FEEDBACK_FROM_EMAIL   = process.env.FEEDBACK_FROM_EMAIL || "onboarding@resend.dev";
 
-async function sendFeedbackEmail({ email, rating, text }) {
+// Generic admin-alert sender — used for feedback notifications AND for
+// the "all API keys just failed" alert below. Never throws: an email
+// failure must never break the thing that triggered it.
+async function sendAdminAlertEmail(subject, html) {
     if (!RESEND_API_KEY) {
-        console.warn('[Orion] RESEND_API_KEY not set — skipping feedback email notification.');
+        console.warn('[Orion] RESEND_API_KEY not set — skipping admin alert email.');
         return;
     }
     try {
-        const stars = '⭐'.repeat(Math.max(0, Math.min(5, Number(rating) || 0)));
-        const safeText = (text || '(no message)')
-            .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-
         const resp = await fetch('https://api.resend.com/emails', {
             method: 'POST',
             headers: {
@@ -89,25 +88,92 @@ async function sendFeedbackEmail({ email, rating, text }) {
             body: JSON.stringify({
                 from: `Orion Hub <${FEEDBACK_FROM_EMAIL}>`,
                 to: [FEEDBACK_NOTIFY_EMAIL],
-                subject: `New Orion Hub Feedback (${rating}/5) from ${email}`,
-                html: `
-                    <h2>New Feedback Received</h2>
-                    <p><strong>From:</strong> ${email}</p>
-                    <p><strong>Rating:</strong> ${stars} (${rating}/5)</p>
-                    <p><strong>Message:</strong></p>
-                    <p style="white-space:pre-wrap;">${safeText}</p>
-                `
+                subject,
+                html
             })
         });
-
         if (!resp.ok) {
             const errBody = await resp.text();
             console.error('[Orion] Resend email failed:', resp.status, errBody);
         }
     } catch (e) {
-        // Never let an email failure break feedback submission.
-        console.error('[Orion] Error sending feedback email:', e.message);
+        console.error('[Orion] Error sending admin alert email:', e.message);
     }
+}
+
+async function sendFeedbackEmail({ email, rating, text }) {
+    const stars = '⭐'.repeat(Math.max(0, Math.min(5, Number(rating) || 0)));
+    const safeText = (text || '(no message)')
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+    await sendAdminAlertEmail(
+        `New Orion Hub Feedback (${rating}/5) from ${email}`,
+        `
+            <h2>New Feedback Received</h2>
+            <p><strong>From:</strong> ${email}</p>
+            <p><strong>Rating:</strong> ${stars} (${rating}/5)</p>
+            <p><strong>Message:</strong></p>
+            <p style="white-space:pre-wrap;">${safeText}</p>
+        `
+    );
+}
+
+// ── PROVIDER ERROR CLASSIFICATION ─────────────────────
+// The old code marked a key "exhausted" on ANY error — including a
+// deprecated model ID, a network blip, or a content-safety block. That
+// meant a single code bug (like a dead model string) could burn through
+// and disable every key in the pool within seconds, for real users, with
+// no signal pointing at the actual cause. This classifies WHY a call
+// failed so only genuine per-key problems disable that key:
+//   'quota'     — rate/usage limit hit. Not the key's fault long-term;
+//                 goes on a short cooldown and comes back automatically.
+//   'invalid'   — bad API key, bad model ID, permission error. A real
+//                 problem that needs a human to fix — key is disabled
+//                 AND an admin alert fires so it's noticed immediately.
+//   'transient' — network blip / provider hiccup. Try the next key for
+//                 THIS request, but don't disable anything.
+function classifyProviderError(err) {
+    const status = err?.status || err?.response?.status || err?.statusCode;
+    const msg = (err?.message || '').toLowerCase();
+
+    if (status === 429 || msg.includes('quota') || msg.includes('rate limit')) return 'quota';
+    if (status === 401 || status === 403 || msg.includes('api key not valid') || msg.includes('invalid api key')) return 'invalid';
+    if (status === 404 || msg.includes('not found') || msg.includes('is not found') || msg.includes('unsupported')) return 'invalid';
+    if (status >= 500 || msg.includes('timeout') || msg.includes('econnreset') || msg.includes('fetch failed')) return 'transient';
+    return 'invalid'; // unknown errors are treated conservatively, as needing a human look
+}
+
+// Applies the right outcome to a key based on classification, and
+// returns it so the caller can decide whether to keep trying other keys.
+async function handleProviderKeyError(keyRow, provider, err) {
+    const kind = classifyProviderError(err);
+    const message = (err?.message || String(err)).slice(0, 500);
+
+    if (kind === 'quota') {
+        // Short cooldown, NOT marked exhausted — will be picked up again
+        // automatically once the cooldown passes (see the key-fetch filter).
+        const cooldownUntil = new Date(Date.now() + 2 * 60 * 1000).toISOString(); // 2 min
+        await supabase.from('api_keys')
+            .update({ cooldown_until: cooldownUntil, last_error: message, last_error_at: new Date().toISOString() })
+            .eq('id', keyRow.id);
+    } else if (kind === 'invalid') {
+        await supabase.from('api_keys')
+            .update({ status: 'exhausted', last_error: message, last_error_at: new Date().toISOString() })
+            .eq('id', keyRow.id);
+        // Fire-and-forget — a broken key/model is worth knowing about
+        // immediately, not discovering from user complaints.
+        sendAdminAlertEmail(
+            `⚠️ Orion Hub: ${provider} key #${keyRow.id} disabled`,
+            `<h2>An API key was disabled</h2>
+             <p><strong>Provider:</strong> ${provider}</p>
+             <p><strong>Key ID:</strong> ${keyRow.id}</p>
+             <p><strong>Reason:</strong></p>
+             <p style="white-space:pre-wrap;">${message}</p>
+             <p>If this looks like a deprecated model ID or a config issue rather than a bad key, fix the code/config rather than just resetting the key — it will fail again immediately otherwise.</p>`
+        );
+    }
+    // 'transient' — no DB write at all, just try the next key this request.
+    return kind;
 }
 
 // ── PLAN PRICING (server-side — never trust a price from the client) ──
@@ -382,7 +448,7 @@ export default async function handler(req, res) {
 
             const { data: keys, error } = await supabase
                 .from('api_keys')
-                .select('id, provider, api_key, status, usage_count, created_at')
+                .select('id, provider, api_key, status, usage_count, cooldown_until, last_error, last_error_at, created_at')
                 .order('created_at', { ascending: false });
 
             if (error) throw error;
@@ -420,8 +486,19 @@ export default async function handler(req, res) {
                 return res.status(400).json({ error: 'Status must be: active or exhausted' });
             }
 
+            // An admin explicitly setting a key back to 'active' means
+            // "this is fine now" — clear any stale cooldown from before,
+            // or it would silently stay invisible to the generate route
+            // until that old timestamp happens to pass on its own.
+            const updates = { status };
+            if (status === 'active') {
+                updates.cooldown_until = null;
+                updates.last_error = null;
+                updates.last_error_at = null;
+            }
+
             const { error } = await supabase
-                .from('api_keys').update({ status }).eq('id', id);
+                .from('api_keys').update(updates).eq('id', id);
             if (error) throw error;
             return res.status(200).json({ success: true });
         }
@@ -434,7 +511,9 @@ export default async function handler(req, res) {
             if (!id) return res.status(400).json({ error: 'Key ID required.' });
 
             const { error } = await supabase
-                .from('api_keys').update({ usage_count: 0, status: 'active' }).eq('id', id);
+                .from('api_keys')
+                .update({ usage_count: 0, status: 'active', cooldown_until: null, last_error: null, last_error_at: null })
+                .eq('id', id);
             if (error) throw error;
             return res.status(200).json({ success: true });
         }
@@ -517,9 +596,13 @@ export default async function handler(req, res) {
                 return res.status(403).json({ planBlocked: true, message: "Free trials over. Please upgrade." });
             }
 
-            // Fetch keys — least used first (round robin)
+            // Fetch keys — least used first (round robin). A key on cooldown
+            // (temporary, from a quota hit) is skipped until its cooldown
+            // passes, without needing any manual admin action.
+            const nowIso = new Date().toISOString();
             const { data: keys, error: kErr } = await supabase
                 .from('api_keys').select('*').eq('status', 'active')
+                .or(`cooldown_until.is.null,cooldown_until.lt.${nowIso}`)
                 .order('usage_count', { ascending: true });
 
             if (kErr || !keys || keys.length === 0) {
@@ -534,7 +617,8 @@ export default async function handler(req, res) {
 
             // ── GEMINI ───────────────────────────────
             if (needsVision || currentTool === 'pitch') {
-                if (geminiKeys.length === 0) throw new Error("No active Gemini keys available.");
+                if (geminiKeys.length === 0) throw new Error("No Gemini keys available right now (all on cooldown or disabled). Please try again shortly.");
+                let succeeded = false;
                 for (let i = 0; i < geminiKeys.length; i++) {
                     try {
                         const genAI = new GoogleGenerativeAI(geminiKeys[i].api_key);
@@ -549,18 +633,22 @@ export default async function handler(req, res) {
                         const result = await model.generateContent(parts);
                         finalAIResponse = result.response.text();
                         await supabase.from('api_keys')
-                            .update({ usage_count: (geminiKeys[i].usage_count || 0) + 1 })
+                            .update({ usage_count: (geminiKeys[i].usage_count || 0) + 1, last_error: null })
                             .eq('id', geminiKeys[i].id);
+                        succeeded = true;
                         break;
                     } catch (err) {
-                        await supabase.from('api_keys').update({ status: 'exhausted' }).eq('id', geminiKeys[i].id);
-                        if (i === geminiKeys.length - 1) throw new Error("All Gemini keys exhausted.");
+                        await handleProviderKeyError(geminiKeys[i], 'gemini', err);
+                        // keep trying the next key regardless of error kind —
+                        // no reason to give up early within a single request
                     }
                 }
+                if (!succeeded) throw new Error("All Gemini keys failed for this request. An admin alert has been sent.");
 
             // ── GROQ ─────────────────────────────────
             } else {
-                if (groqKeys.length === 0) throw new Error("No active Groq keys available.");
+                if (groqKeys.length === 0) throw new Error("No Groq keys available right now (all on cooldown or disabled). Please try again shortly.");
+                let succeeded = false;
                 for (let i = 0; i < groqKeys.length; i++) {
                     try {
                         const groq = new Groq({ apiKey: groqKeys[i].api_key });
@@ -571,14 +659,15 @@ export default async function handler(req, res) {
                         });
                         finalAIResponse = completion.choices[0].message.content;
                         await supabase.from('api_keys')
-                            .update({ usage_count: (groqKeys[i].usage_count || 0) + 1 })
+                            .update({ usage_count: (groqKeys[i].usage_count || 0) + 1, last_error: null })
                             .eq('id', groqKeys[i].id);
+                        succeeded = true;
                         break;
                     } catch (err) {
-                        await supabase.from('api_keys').update({ status: 'exhausted' }).eq('id', groqKeys[i].id);
-                        if (i === groqKeys.length - 1) throw new Error("All Groq keys exhausted.");
+                        await handleProviderKeyError(groqKeys[i], 'groq', err);
                     }
                 }
+                if (!succeeded) throw new Error("All Groq keys failed for this request. An admin alert has been sent.");
             }
 
             // Deduct trial
