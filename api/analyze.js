@@ -1,6 +1,8 @@
 import { createClient } from '@supabase/supabase-js';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import Groq from 'groq-sdk';
+import Razorpay from 'razorpay';
+import crypto from 'crypto';
 
 // ── SUPABASE (service-role client — server only, bypasses RLS) ──
 // IMPORTANT: SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set as
@@ -27,6 +29,25 @@ try {
     }
 } catch (e) {
     initError = e.message;
+}
+
+// ── RAZORPAY (payments — UPI, cards, netbanking, wallets) ────
+// Requires RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET env vars on the
+// backend project. Guarded separately from the Supabase init above —
+// a missing/invalid Razorpay key must NOT take down every other route
+// (AI generation, feedback, etc.), only the payment routes themselves.
+let razorpay = null;
+let razorpayInitError = null;
+try {
+    const RAZORPAY_KEY_ID     = process.env.RAZORPAY_KEY_ID;
+    const RAZORPAY_KEY_SECRET = process.env.RAZORPAY_KEY_SECRET;
+    if (!RAZORPAY_KEY_ID || !RAZORPAY_KEY_SECRET) {
+        razorpayInitError = "RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET env vars are not set on the backend project.";
+    } else {
+        razorpay = new Razorpay({ key_id: RAZORPAY_KEY_ID, key_secret: RAZORPAY_KEY_SECRET });
+    }
+} catch (e) {
+    razorpayInitError = e.message;
 }
 
 const ORION_ADMINS = [
@@ -88,6 +109,23 @@ async function sendFeedbackEmail({ email, rating, text }) {
         console.error('[Orion] Error sending feedback email:', e.message);
     }
 }
+
+// ── PLAN PRICING (server-side — never trust a price from the client) ──
+async function getPlanAmountPaise(planKey) {
+    const { data: cfg } = await supabase.from('orion_config').select('*').eq('id', 1).maybeSingle();
+    const c = cfg || {
+        weekly_price: 350, monthly_base: 2500, monthly_discount: 30,
+        yearly_base: 10000, yearly_discount: 40
+    };
+    const rupees = {
+        weekly:  c.weekly_price,
+        monthly: Math.round(c.monthly_base * (1 - c.monthly_discount / 100)),
+        yearly:  Math.round(c.yearly_base  * (1 - c.yearly_discount  / 100)),
+    }[planKey];
+    return rupees ? rupees * 100 : null; // Razorpay amounts are in paise
+}
+
+const PAYMENT_PLAN_TRIALS = { weekly: 50, monthly: 300, yearly: 999999 };
 
 // ── TOOL PROMPTS ──────────────────────────────────────
 function buildPrompt(tool, context) {
@@ -232,6 +270,105 @@ export default async function handler(req, res) {
             await sendFeedbackEmail({ email: authedUser.email, rating, text });
 
             return res.status(201).json({ success: true });
+        }
+
+        // ── CREATE RAZORPAY ORDER (requires verified session) ────
+        if (action === 'create-razorpay-order' && req.method === 'POST') {
+            if (razorpayInitError || !razorpay) {
+                return res.status(500).json({ error: 'Payments are not configured yet: ' + razorpayInitError });
+            }
+            const authedUser = await getVerifiedUser(req);
+            if (!authedUser || !authedUser.email) {
+                return res.status(401).json({ error: 'Not authenticated. Please log in again.' });
+            }
+
+            const { plan } = req.body;
+            if (!['weekly', 'monthly', 'yearly'].includes(plan)) {
+                return res.status(400).json({ error: 'Invalid plan.' });
+            }
+
+            const amount = await getPlanAmountPaise(plan);
+            if (!amount) return res.status(400).json({ error: 'Could not determine price for this plan.' });
+
+            const order = await razorpay.orders.create({
+                amount,
+                currency: 'INR',
+                receipt: `orion_${plan}_${Date.now()}`,
+                notes: { email: authedUser.email, plan }
+            });
+
+            return res.status(200).json({
+                success:  true,
+                order_id: order.id,
+                amount:   order.amount,
+                currency: order.currency,
+                key_id:   process.env.RAZORPAY_KEY_ID   // public key — safe to expose to the client
+            });
+        }
+
+        // ── VERIFY RAZORPAY PAYMENT (requires verified session) ──
+        // Razorpay's recommended client-integration flow: the signature
+        // Razorpay returns after a successful checkout is an HMAC-SHA256
+        // of "order_id|payment_id" signed with the (server-only) key
+        // secret. Recomputing it here and comparing is what proves the
+        // payment is real and wasn't forged — it cannot be faked without
+        // knowing RAZORPAY_KEY_SECRET, which never leaves the server.
+        if (action === 'verify-razorpay-payment' && req.method === 'POST') {
+            if (razorpayInitError || !razorpay) {
+                return res.status(500).json({ error: 'Payments are not configured yet: ' + razorpayInitError });
+            }
+            const authedUser = await getVerifiedUser(req);
+            if (!authedUser || !authedUser.email) {
+                return res.status(401).json({ error: 'Not authenticated. Please log in again.' });
+            }
+
+            const { razorpay_order_id, razorpay_payment_id, razorpay_signature, plan } = req.body;
+            if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature || !plan) {
+                return res.status(400).json({ error: 'Missing payment verification fields.' });
+            }
+            if (!PAYMENT_PLAN_TRIALS[plan]) {
+                return res.status(400).json({ error: 'Invalid plan.' });
+            }
+
+            const expectedSignature = crypto
+                .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
+                .update(`${razorpay_order_id}|${razorpay_payment_id}`)
+                .digest('hex');
+
+            if (expectedSignature !== razorpay_signature) {
+                return res.status(400).json({ error: 'Payment signature verification failed.' });
+            }
+
+            const amount = await getPlanAmountPaise(plan);
+
+            // Record the payment. razorpay_payment_id is UNIQUE, so if this
+            // exact payment was already verified before (e.g. a retried
+            // request), the insert fails harmlessly and we skip re-crediting
+            // the account — this makes the endpoint safe to call more than
+            // once for the same payment.
+            const { error: payErr } = await supabase.from('payments').insert([{
+                email: authedUser.email,
+                plan,
+                amount_paise: amount,
+                razorpay_order_id,
+                razorpay_payment_id,
+                status: 'captured'
+            }]);
+
+            if (payErr) {
+                if (payErr.code === '23505') { // unique_violation — already processed
+                    return res.status(200).json({ success: true, alreadyProcessed: true });
+                }
+                throw payErr;
+            }
+
+            const { error: subErr } = await supabase
+                .from('user_subscriptions')
+                .update({ status: plan, trials_left: PAYMENT_PLAN_TRIALS[plan] })
+                .eq('email', authedUser.email);
+            if (subErr) throw subErr;
+
+            return res.status(200).json({ success: true });
         }
 
         // ════════════════════════════════════════
@@ -401,7 +538,7 @@ export default async function handler(req, res) {
                 for (let i = 0; i < geminiKeys.length; i++) {
                     try {
                         const genAI = new GoogleGenerativeAI(geminiKeys[i].api_key);
-                        const model = genAI.getGenerativeModel({ model: "gemini-2.0-flash" });
+                        const model = genAI.getGenerativeModel({ model: "gemini-3.5-flash" });
                         let parts = [{ text: prompt }];
                         if (imageBase64) {
                             const mimeMatch  = imageBase64.match(/data:([a-zA-Z0-9]+\/[a-zA-Z0-9-.+]+);base64,/);
